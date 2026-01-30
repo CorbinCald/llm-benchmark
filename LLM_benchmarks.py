@@ -48,11 +48,12 @@ MODEL_MAPPING = {
     'claudeOpus4.5': 'anthropic/claude-opus-4.5',
     'gemini3_0Flash': 'google/gemini-3-flash-preview',
     'gemini3_0Pro': 'google/gemini-3-pro-preview',
-    'gpt5_2': 'openai/gpt-5.2',
-    'deepseekV3_2': 'deepseek/deepseek-v3.2',
+    #'gpt5_2': 'openai/gpt-5.2',
+    #'deepseekV3_2': 'deepseek/deepseek-v3.2',
     'mimoV2Flash': 'xiaomi/mimo-v2-flash',
     'glm4_7': 'z-ai/glm-4.7',
-    'gpt5_2Codex': 'openai/gpt-5.2-codex'
+    'gpt5_2Codex': 'openai/gpt-5.2-codex',
+    'kimik2_5': 'moonshotai/kimi-k2.5'
 }
 
 def get_target_models():
@@ -72,7 +73,7 @@ async def get_directory_name(session, prompt):
     Uses Gemini to generate a directory name based on the prompt.
     """
     print("Generating directory name...")
-    model = 'google/gemini-3-flash-preview'
+    model = 'google/gemini-2.5-flash'
     naming_prompt = f"Generate a short, concise, snake_case directory name (max 3 words) that summarizes the following prompt. Return ONLY the directory name, no other text, no markdown formatting.\n\nPrompt: {prompt}"
     
     try:
@@ -115,7 +116,7 @@ async def parse_with_gemini(session, content):
     Uses Gemini to parse the content, extract code, and determine the filename.
     """
     print("Parsing content with Gemini...")
-    model = 'google/gemini-3-flash-preview'
+    model = 'google/gemini-2.5-flash'
     parsing_prompt = (
         "You are a code extraction engine. Your task is to extract the executable code "
         "from the provided text. \n"
@@ -163,8 +164,8 @@ async def call_model_async(session, model_id, prompt, reasoning_effort="high"):
         "messages": [
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.3,
-        "max_tokens": 40000,
+        "temperature": 0.2,
+        "max_tokens": 120000,
     }
 
     # Set temperature to 1 for Gemini 3 models
@@ -273,7 +274,7 @@ async def main_async(args):
     print(f"Prompt: {user_prompt}\n")
     
     # Limit concurrency to avoid hitting rate limits too hard and to be more orderly
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(12)
     
     # Increase timeout for large model generations
     timeout = aiohttp.ClientTimeout(total=600) # 10 minutes total per request
