@@ -13,6 +13,8 @@ import re
 import shutil
 import asyncio
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 import aiohttp
 import argparse
@@ -21,6 +23,13 @@ try:
     import readline  # noqa: F401 — enables arrow-key/history editing in input()
 except ImportError:
     pass
+
+try:
+    import tty
+    import termios
+    _HAS_TTY = True
+except ImportError:
+    _HAS_TTY = False
 
 
 # ━━ Configuration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -575,6 +584,341 @@ async def parse_with_gemini(session, api_key, model_name, content):
         return None
 
 
+# ━━ Model Selection ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _generate_short_name(model_id):
+    """Generate a camelCase short name from 'provider/model-name-v1'."""
+    name = model_id.split('/')[-1] if '/' in model_id else model_id
+    parts = re.split(r'[-_]+', name)
+    if not parts:
+        return name
+    result = parts[0].lower()
+    for p in parts[1:]:
+        if p:
+            result += (p if p[0].isdigit() else p[0].upper() + p[1:])
+    return result
+
+
+def _unique_short_name(model_id, existing_names):
+    """Generate a unique short name that doesn't collide with *existing_names*."""
+    base = _generate_short_name(model_id)
+    if base not in existing_names:
+        return base
+    counter = 2
+    while f"{base}_{counter}" in existing_names:
+        counter += 1
+    return f"{base}_{counter}"
+
+
+_TIER1_PROVIDERS = frozenset({
+    "anthropic", "openai", "google", "deepseek", "x-ai",
+    "moonshotai", "minimax",
+})
+_TIER2_PROVIDERS = frozenset({
+    "z-ai", "qwen", "meta-llama", "mistralai", "bytedance-seed",
+    "microsoft", "cohere",
+})
+
+
+def _model_score(m):
+    """Score a model for popularity ranking (higher = more prominent)."""
+    mid = m.get("id", "")
+    provider = mid.split("/")[0] if "/" in mid else ""
+
+    score = 0
+
+    # Provider tier
+    if provider in _TIER1_PROVIDERS:
+        score += 1000
+    elif provider in _TIER2_PROVIDERS:
+        score += 500
+
+    # Pricing tier — paid models ranked above free; higher price = more
+    # capable frontier model, but capped so price doesn't dominate.
+    pricing = m.get("pricing", {})
+    try:
+        pp = float(pricing.get("prompt") or 0)
+    except (TypeError, ValueError):
+        pp = 0
+    if pp > 0:
+        score += 200 + min(300, pp * 50_000)  # caps at ~$6/M tokens
+
+    # Recency bonus — newer models are more relevant
+    created = m.get("created") or 0
+    # ~10 points per day within the last 90 days
+    age_days = max(0, (time.time() - created) / 86400)
+    score += max(0, 200 - age_days * 2.2)
+
+    # Capability bonuses
+    params = m.get("supported_parameters") or []
+    if "reasoning" in params:
+        score += 80
+    if "tools" in params:
+        score += 40
+
+    # Context length bonus (log-scale)
+    ctx = m.get("context_length") or 0
+    if ctx >= 100_000:
+        score += 60
+    elif ctx >= 32_000:
+        score += 30
+
+    return score
+
+
+def fetch_top_models(api_key, count=12):
+    """Fetch models from OpenRouter, returning (top_for_menu, pricing_lookup).
+
+    *top_for_menu* is a list of model dicts sorted by popularity score.
+    *pricing_lookup* maps **every** model ID to its pricing dict so the
+    caller can look up pricing for any model (including ones already in
+    the user's config).
+    """
+    req = urllib.request.Request(
+        f"{API_URL}/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as exc:
+        print(f"    {_tri} {S.DIM}could not fetch models: {exc}{S.RST}")
+        return [], {}
+
+    all_models = data.get("data", [])
+
+    # Build pricing lookup for every model
+    pricing_lookup = {}
+    for m in all_models:
+        mid = m.get("id", "")
+        if mid:
+            pricing_lookup[mid] = m.get("pricing", {})
+
+    # Filter candidates for the menu
+    seen_slugs = set()
+    filtered = []
+    for m in all_models:
+        mid = m.get("id", "")
+        arch = m.get("architecture", {})
+        out_mods = arch.get("output_modalities") or []
+        in_mods = arch.get("input_modalities") or []
+
+        # Must accept text input and produce text output
+        if "text" not in in_mods or "text" not in out_mods:
+            continue
+        # Skip audio-output models
+        if "audio" in out_mods:
+            continue
+        # Skip :free duplicate variants (keep the paid original)
+        if ":free" in mid:
+            continue
+        # Skip routers and cloaked/anonymous models
+        if mid.startswith("openrouter/"):
+            continue
+        # Skip roleplay / her-specific models
+        name_lower = m.get("name", "").lower()
+        if "-her" in mid or "roleplay" in name_lower:
+            continue
+        # Deduplicate by canonical slug
+        slug = m.get("canonical_slug", mid)
+        if slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+
+        filtered.append(m)
+
+    # Sort by popularity score descending
+    filtered.sort(key=_model_score, reverse=True)
+    return filtered[:count], pricing_lookup
+
+
+def _format_price(pricing_dict):
+    """Format OpenRouter pricing as '$in/$out /M' (per million tokens)."""
+    try:
+        pp = float(pricing_dict.get("prompt") or 0) * 1_000_000
+        cp = float(pricing_dict.get("completion") or 0) * 1_000_000
+    except (TypeError, ValueError):
+        return ""
+    if pp == 0 and cp == 0:
+        return ""
+    return f"${pp:,.2f}/${cp:,.2f} /M"
+
+
+def _read_key():
+    """Read a single keypress from the terminal, handling escape sequences."""
+    if not _HAS_TTY:
+        ch = input()[:1]
+        return ch or 'enter'
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            ch2 = sys.stdin.read(1)
+            if ch2 == '[':
+                ch3 = sys.stdin.read(1)
+                return {'A': 'up', 'B': 'down'}.get(ch3, '')
+            return 'escape'
+        if ch in ('\r', '\n'):
+            return 'enter'
+        if ch == ' ':
+            return 'space'
+        if ch == '\x03':
+            return 'ctrl-c'
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def interactive_model_menu(available_models, current_mapping,
+                           pricing_lookup=None):
+    """Full-screen interactive model selector.
+
+    Returns ``{short_name: model_id}`` of selected models, or *None* if
+    the user cancels.
+
+    *pricing_lookup* is an ``{model_id: pricing_dict}`` map used to
+    populate pricing for every item (including *current_mapping* models).
+    """
+    if not sys.stdin.isatty() or not _HAS_TTY:
+        print(f"  {S.DIM}Interactive selection requires a terminal.{S.RST}")
+        return None
+
+    pricing_lookup = pricing_lookup or {}
+
+    # ── Build item list ───────────────────────────────────────────────────
+    items = []
+    seen_ids = set()
+    existing_names = set()
+
+    # Currently configured models — pre-selected, with pricing from lookup
+    for short_name, model_id in current_mapping.items():
+        items.append({
+            'short': short_name, 'id': model_id,
+            'selected': True,
+            'pricing': _format_price(pricing_lookup.get(model_id, {})),
+        })
+        seen_ids.add(model_id)
+        existing_names.add(short_name)
+
+    # Available models from OpenRouter — unselected unless already present
+    for m in available_models:
+        mid = m.get('id', '')
+
+        if mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+
+        short = _unique_short_name(mid, existing_names)
+        existing_names.add(short)
+
+        items.append({
+            'short': short, 'id': mid,
+            'selected': False,
+            'pricing': _format_price(pricing_lookup.get(mid, {})),
+        })
+
+    if not items:
+        print(f"  {S.DIM}No models available.{S.RST}")
+        return None
+
+    cursor_pos = 0
+    short_w = max(len(it['short']) for it in items) + 2
+    id_w = max(len(it['id']) for it in items) + 2
+    menu_lines = len(items) + 4   # header(2) + items + blank + footer
+
+    # ── Render helper ─────────────────────────────────────────────────────
+    def render(first=False):
+        if not first:
+            sys.stdout.write(f"\033[{menu_lines}A")
+
+        sys.stdout.write(
+            f"\033[K  {S.DIM}↑↓{S.RST} navigate  {_dot}  "
+            f"{S.DIM}Space{S.RST} toggle  {_dot}  "
+            f"{S.DIM}Enter{S.RST} confirm  {_dot}  "
+            f"{S.DIM}a{S.RST} all  {_dot}  "
+            f"{S.DIM}n{S.RST} none  {_dot}  "
+            f"{S.DIM}q{S.RST} cancel\n")
+        sys.stdout.write("\033[K\n")
+
+        for i, item in enumerate(items):
+            is_cur = i == cursor_pos
+            chk = f"{S.HGRN}✓{S.RST}" if item['selected'] else " "
+
+            if is_cur:
+                mk = f"{S.HCYN}▸{S.RST}"
+                ns = f"{S.BOLD}{item['short']:<{short_w}}{S.RST}"
+                ids = f"{S.CYN}{item['id']:<{id_w}}{S.RST}"
+            else:
+                mk = " "
+                ns = f"{item['short']:<{short_w}}"
+                ids = f"{S.DIM}{item['id']:<{id_w}}{S.RST}"
+
+            ps = (f"  {S.DIM}{item['pricing']}{S.RST}"
+                  if item['pricing'] else "")
+            sys.stdout.write(
+                f"\033[K  {mk} [{chk}] {ns} {ids}{ps}\n")
+
+        sys.stdout.write("\033[K\n")
+        sel = sum(1 for it in items if it['selected'])
+        sys.stdout.write(
+            f"\033[K  {S.BOLD}{sel}{S.RST} of {len(items)} selected\n")
+        sys.stdout.flush()
+
+    # ── Draw & event loop ─────────────────────────────────────────────────
+    sys.stdout.write("\033[?25l")  # hide cursor
+    try:
+        render(first=True)
+        while True:
+            key = _read_key()
+            if key in ('q', 'escape', 'ctrl-c'):
+                sys.stdout.write("\033[?25h")
+                print()
+                return None
+            elif key == 'up':
+                cursor_pos = (cursor_pos - 1) % len(items)
+            elif key == 'down':
+                cursor_pos = (cursor_pos + 1) % len(items)
+            elif key == 'space':
+                items[cursor_pos]['selected'] = \
+                    not items[cursor_pos]['selected']
+            elif key == 'enter':
+                break
+            elif key == 'a':
+                for it in items:
+                    it['selected'] = True
+            elif key == 'n':
+                for it in items:
+                    it['selected'] = False
+            render()
+    finally:
+        sys.stdout.write("\033[?25h")  # show cursor
+
+    selected = {it['short']: it['id'] for it in items if it['selected']}
+    if not selected:
+        print(f"\n  {S.HYEL}No models selected — keeping current config."
+              f"{S.RST}")
+        return None
+
+    print()
+    return selected
+
+
+def run_model_selection(api_key):
+    """Fetch available models from OpenRouter and open the selector."""
+    print(f"  {_work} {S.DIM}Fetching models from OpenRouter…{S.RST}")
+    available, pricing_lookup = fetch_top_models(api_key)
+    if not available:
+        print(f"  {S.DIM}Could not fetch remote models — "
+              f"showing local config only.{S.RST}")
+    print()
+    _rule("Model Selection")
+    print()
+    return interactive_model_menu(available, MODEL_MAPPING,
+                                  pricing_lookup=pricing_lookup)
+
+
 # ━━ Model Processing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def process_model(session, api_key, model_name, model_id, prompt,
@@ -696,7 +1040,11 @@ async def process_model_text(session, api_key, model_name, model_id, prompt,
 
 # ━━ Main ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def main_async(args, api_key):
+async def main_async(args, api_key, model_mapping=None):
+    global _PAD
+    mapping = model_mapping if model_mapping is not None else MODEL_MAPPING
+    _PAD = max((len(n) for n in mapping), default=12) + 4
+
     user_prompt = args.prompt
     text_mode = getattr(args, "text", False)
 
@@ -713,7 +1061,7 @@ async def main_async(args, api_key):
             else ".html"
         )
 
-    targets = list(MODEL_MAPPING.items())
+    targets = list(mapping.items())
     if not targets:
         print(f"  {_fail} No models configured in MODEL_MAPPING.")
         return
@@ -862,6 +1210,9 @@ def main():
     parser.add_argument(
         "--clear-history", action="store_true",
         help="Reset analytics history")
+    parser.add_argument(
+        "--models", action="store_true",
+        help="Interactively select which models to benchmark")
     args = parser.parse_args()
 
     # ── Stats-only mode ────────────────────────────────────────────────────
@@ -892,27 +1243,73 @@ def main():
         print(f"     Set via environment variable or .env file.\n")
         sys.exit(1)
 
-    # ── Interactive prompt ─────────────────────────────────────────────────
-    if not args.prompt:
+    # ── Model selection (CLI flag: --models) ──────────────────────────────
+    selected_models = None
+
+    if args.models:
         print()
         _rule("LLM BENCHMARK", heavy=True)
         print()
+        selected_models = run_model_selection(api_key)
+        if selected_models is None:
+            print(f"  {S.DIM}Cancelled.{S.RST}\n")
+            return
+
+    # ── Interactive prompt ─────────────────────────────────────────────────
+    if not args.prompt:
+        if not args.models:
+            print()
+            _rule("LLM BENCHMARK", heavy=True)
+            print()
 
         # ── Mode selection (skip if --text was passed on CLI) ─────────
         if not args.text:
-            print(f"  {S.DIM}Select mode:{S.RST}  "
-                  f"{S.HCYN}[1]{S.RST} Code  "
-                  f"{S.HYEL}[2]{S.RST} Text")
-            try:
-                mode_input = input(
-                    f"  \001{S.DIM}\002mode\001{S.RST}\002 "
-                    f"\001{S.HCYN}\002›\001{S.RST}\002 ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print(f"\n  {S.DIM}Interrupted.{S.RST}\n")
-                return
-            if mode_input == "2":
-                args.text = True
+            def _print_mode_menu():
+                print(f"  {S.DIM}Select mode:{S.RST}  "
+                      f"{S.HCYN}[1]{S.RST} Code  "
+                      f"{S.HYEL}[2]{S.RST} Text")
+                active = (selected_models
+                          if selected_models is not None
+                          else MODEL_MAPPING)
+                print(f"  {S.DIM}{len(active)} models active{S.RST}  "
+                      f"{S.BLU}[m]{S.RST} manage")
+            _print_mode_menu()
+
+            while True:
+                try:
+                    mode_input = input(
+                        f"  \001{S.DIM}\002mode\001{S.RST}\002 "
+                        f"\001{S.HCYN}\002›\001{S.RST}\002 ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    print(f"\n  {S.DIM}Interrupted.{S.RST}\n")
+                    return
+
+                if mode_input.lower() == "m":
+                    print()
+                    result = run_model_selection(api_key)
+                    if result is not None:
+                        selected_models = result
+                    else:
+                        print(f"  {S.DIM}Cancelled — "
+                              f"keeping current models.{S.RST}")
+                    print()
+                    _print_mode_menu()
+                    continue
+
+                if mode_input == "2":
+                    args.text = True
+                break
             print()
+
+        # Show active models summary
+        active = (selected_models
+                  if selected_models is not None else MODEL_MAPPING)
+        names = list(active.keys())
+        summary = ", ".join(names[:6])
+        if len(names) > 6:
+            summary += f", … (+{len(names) - 6})"
+        print(f"  {S.DIM}{len(active)} models:{S.RST} {summary}")
+        print()
 
         try:
             # \001 / \002 tell readline that enclosed chars are non-printing
@@ -930,7 +1327,7 @@ def main():
         print()
 
     try:
-        asyncio.run(main_async(args, api_key))
+        asyncio.run(main_async(args, api_key, model_mapping=selected_models))
     except KeyboardInterrupt:
         print(f"\n\n  {S.DIM}Interrupted.{S.RST}\n")
 
